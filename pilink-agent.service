@@ -1,0 +1,15 @@
+[Unit]
+Description=PiLink Self-Healing Agent
+After=network.target pilink-server.service
+
+[Service]
+Type=simple
+User=spencermoya
+ExecStart=/home/spencermoya/.pilink/venv/bin/python3 -u /home/spencermoya/.pilink/pilink-agent.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

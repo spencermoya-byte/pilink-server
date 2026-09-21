@@ -1,0 +1,16 @@
+[Unit]
+Description=PiLink TCP Server
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spencermoya
+ExecStart=/home/spencermoya/.pilink/venv/bin/python3 -u /home/spencermoya/.pilink/pilink-server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

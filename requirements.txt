@@ -1,0 +1,11 @@
+bless==0.3.0
+dbus-next>=0.2.3
+zeroconf>=0.131.0
+watchdog>=3.0.0
+# APNs push notifications (HTTP/2 is required by Apple's provider API).
+# ES256 JWT signing uses `cryptography`, already pulled in by paramiko.
+httpx[http2]>=0.27.0
+# MQTT client for the thermostat sensor node (Phase 2). Works on paho 1.x + 2.x.
+paho-mqtt>=1.6
+# Local control of the Midea Duo AC (Phase 2 M2). Validated against 2026.8.0.
+msmart-ng>=2024.1
