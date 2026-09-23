@@ -30,4 +30,4 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 ```
 
 ---
-Published from release `manual`.
+Published from release `v0.3.8`.

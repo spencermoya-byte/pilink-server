@@ -1,3 +1,10 @@
+# pilink-server.py:15 does `import psutil, paramiko` at module scope, so a
+# missing one is not a degraded feature - the service crash-loops on startup and
+# never writes config.json, which reads downstream as "the install hung".
+# cryptography arrives transitively with paramiko.
+psutil>=5.9
+paramiko>=3.4
+
 bless==0.3.0
 dbus-next>=0.2.3
 zeroconf>=0.131.0

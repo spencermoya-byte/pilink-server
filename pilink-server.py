@@ -3418,7 +3418,13 @@ class ClientSession:
                         self.send({'type': 'auth_fail', 'error': 'Too many attempts'})
                         self.conn.close()
                         return
-                if msg.get('pairingKey') == CONFIG['pairing_key']:
+                supplied = msg.get('pairingKey')
+                try:
+                    key_ok = isinstance(supplied, str) and hmac.compare_digest(
+                        supplied.encode('utf-8'), CONFIG['pairing_key'].encode('utf-8'))
+                except Exception:
+                    key_ok = False
+                if key_ok:
                     with _AUTH_LOCK:
                         _AUTH_FAILS.pop(ip, None)
                         _save_auth_fails(_AUTH_FAILS)
@@ -3956,6 +3962,10 @@ class ClientSession:
                 os.execvpe('/bin/bash', ['/bin/bash', '-i'],
                            {**os.environ, 'TERM': 'xterm-256color'})
             else:
+                # The terminal is the highest-privilege surface in the product
+                # and was the only one leaving no audit record. Logged once per
+                # PTY, not per keystroke.
+                audit('terminal_open', {'ip': self.addr[0], 'pid': self.term_pid})
                 threading.Thread(target=self._term_read, daemon=True).start()
         try:
             os.write(self.term_fd, msg['data'].encode())
