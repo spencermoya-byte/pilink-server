@@ -18,6 +18,7 @@ deploy that fails is fine; a deploy that fails without naming the fix is the bug
 """
 import ast
 import json
+import sys
 import time
 import types
 from pathlib import Path
@@ -46,18 +47,38 @@ def load(names, **globals_):
 
 # ── preflight ────────────────────────────────────────────────────────────────
 
-def _preflight(apns=True, key=True, tokens=True):
+def _preflight(apns=True, key=True, tokens=True, httpx=True):
     ns = load(
         {"sentinel_preflight"},
         _apns_config=lambda: {"bundleId": "com.spencer.pilink"} if apns else None,
         APNS_KEY_FILE=types.SimpleNamespace(exists=lambda: key),
         load_push_tokens=lambda: {"tok": 1} if tokens else {},
     )
-    return ns["sentinel_preflight"]()
+    # The preflight really does `import httpx`, so whether httpx happens to be
+    # installed on the machine running the tests decided this test's outcome:
+    # green on a dev box, red in CI (which installs only pytest + ruff). Pin it.
+    saved = sys.modules.get("httpx", _MISSING)
+    sys.modules["httpx"] = types.ModuleType("httpx") if httpx else None
+    try:
+        return ns["sentinel_preflight"]()
+    finally:
+        if saved is _MISSING:
+            sys.modules.pop("httpx", None)
+        else:
+            sys.modules["httpx"] = saved
+
+
+_MISSING = object()
 
 
 def test_preflight_clean_when_everything_is_ready():
     assert _preflight()["ok"] is True
+
+
+def test_preflight_names_a_missing_httpx():
+    r = _preflight(httpx=False)
+    assert r["ok"] is False
+    assert any(b["code"] == "httpx" for b in r["blockers"])
 
 
 @pytest.mark.parametrize("kwargs,code", [

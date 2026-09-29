@@ -4,6 +4,7 @@
 # Install: pip3 install psutil paramiko --break-system-packages
 
 import urllib.request
+import urllib.error
 import urllib.parse
 import os, json, time, select, socket, ssl, threading, subprocess, secrets, shutil, stat, hashlib, re
 import base64
@@ -11,6 +12,7 @@ import hmac
 import sys
 import traceback
 import pty
+import signal
 from pathlib import Path
 import psutil, paramiko
 
@@ -44,6 +46,7 @@ PORT = 7788
 AUTH_MAX_ATTEMPTS = 5
 AUTH_WINDOW_SEC   = 60        # sliding window length
 _AUTH_LOCK   = threading.Lock()
+_CERT_FETCHES = {}   # ip -> recent pre-auth cert fetch times
 _AUDIT_LOCK  = threading.Lock()
 
 # Allowed base directories for all file operations (path traversal guard)
@@ -526,7 +529,7 @@ def _plain_reason(detail):
     to put 'sudo: a password is required' on someone's lock screen.
     """
     d = (detail or '').lower()
-    if 'password is required' in d or 'not allowed' in d:
+    if 'password is required' in d or 'not allowed' in d or 'interactive authentication' in d:
         return "PiLink doesn't have permission to do that on your Pi."
     if 'timed out' in d or 'timeout' in d:
         return 'It took too long, so it was stopped.'
@@ -537,6 +540,42 @@ def _plain_reason(detail):
     if 'connection refused' in d or 'unreachable' in d:
         return "Something it needed wasn't reachable."
     return None
+
+
+def _plain_fix(detail, sched=None):
+    """What to actually DO about a failed schedule.
+
+    `_plain_reason` says what went wrong in words a lock screen can carry; this
+    is the other half, shown in the app. The old notification said "Open PiLink
+    for details" and the app had no details to show -- the error was printed to
+    the journal and nowhere else. Always returns something: even the fallback
+    points at a place the full error can be seen.
+    """
+    d = (detail or '').lower()
+    t = (sched or {}).get('type')
+    if ('password is required' in d or 'not allowed' in d
+            or 'interactive authentication' in d):
+        if t in ('reboot', 'shutdown', 'update'):
+            return ("Your Pi hasn't given PiLink permission for this yet. On the Pi, run "
+                    "sudo bash ~/.pilink/fix-permissions.sh once, then tap Run Now to check.")
+        return ("Scheduled tasks can't type a password. Remove sudo from the command, "
+                "or add a NOPASSWD sudoers rule for that exact command.")
+    if 'invalid cron' in d or 'no cron expression' in d:
+        return 'Open the task and set its time again.'
+    if 'nothing to run' in d:
+        return 'Open the task and enter the command it should run.'
+    if 'timed out' in d:
+        return ('Tasks are stopped after an hour. Split it into smaller tasks, or start it '
+                'with nohup … & so it carries on in the background.')
+    if 'no such file' in d or 'not found' in d:
+        return ("Check the spelling and use a full path, like /home/you/backup.sh. "
+                "Scheduled tasks don't load your shell profile, so they can't see "
+                "everything a terminal can.")
+    if 'permission denied' in d:
+        return 'If it runs a script, make the script executable: chmod +x <path>.'
+    if 'connection refused' in d or 'unreachable' in d:
+        return "Check the Pi's network connection, then tap Run Now to try again."
+    return 'Run the same command in the Terminal to see the full output.'
 
 
 # ── In-app alert history ─────────────────────────────────────────────────────
@@ -586,11 +625,12 @@ def _alert_meta(category, title, body):
     return 'custom', sev, text
 
 
-def record_alert(category, title, body, key=None):
+def record_alert(category, title, body, key=None, message=None):
     """Append one alert to the rolling history and broadcast it to connected apps.
     Light-deduped (same event within 30s is one entry) so a flapping condition
     can't bury the list."""
-    atype, severity, message = _alert_meta(category, title, body)
+    atype, severity, derived = _alert_meta(category, title, body)
+    message = message or derived
     now = int(time.time() * 1000)
     dedup = (category, key or message)
     with _alerts_lock:
@@ -605,7 +645,8 @@ def record_alert(category, title, body, key=None):
     broadcast({'type': 'alert', 'data': alert})
 
 
-def push_notify(category, title, body, key=None, extra=None, bypass_cooldown=False):
+def push_notify(category, title, body, key=None, extra=None, bypass_cooldown=False,
+                alert_message=None):
     # Returns {'sent': n, 'failed': n, 'errors': [...], 'skipped': reason|None}.
     # Callers that report to the user MUST use this rather than assuming success:
     # the old test handler claimed "sent" the moment a thread started, so every
@@ -625,7 +666,7 @@ def push_notify(category, title, body, key=None, extra=None, bypass_cooldown=Fal
     # test push isn't a real event, so those are skipped.
     if not bypass_cooldown:
         try:
-            record_alert(category, title, body, key)
+            record_alert(category, title, body, key, message=alert_message)
         except Exception as e:
             print(f'[alerts] {e}')
     tokens = load_push_tokens()
@@ -657,7 +698,10 @@ def push_notify(category, title, body, key=None, extra=None, bypass_cooldown=Fal
 
     payload = {
         'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default'},
-        'pilink': {'category': category, 'device': CONFIG['name'], **(extra or {})},
+        # piId lets a tap find the right Pi even if two share a name or one
+        # was renamed -- the name alone is how #1's pairing bug happened.
+        'pilink': {'category': category, 'device': CONFIG['name'],
+                   'piId': CONFIG.get('pi_id'), **(extra or {})},
     }
     topic = cfg.get('bundleId', 'com.spencer.pilink')
     changed = False
@@ -801,7 +845,8 @@ def _sentinel_payload(kind='unexpected', label=''):
         body  = ('No response for several minutes, and nothing was scheduled — '
                  'it may have lost power or dropped off the network.')
     return {'aps': {'alert': {'title': title, 'body': body}, 'sound': 'default'},
-            'pilink': {'category': 'presence', 'device': name, 'sentinel': True, 'kind': kind}}
+            'pilink': {'category': 'presence', 'device': name, 'piId': CONFIG.get('pi_id'),
+                       'sentinel': True, 'kind': kind}}
 
 
 def sentinel_send(deadline_sec, kind='unexpected', label='', disarm=False):
@@ -1922,7 +1967,7 @@ def load_agent_status():
     return {'agentRunning': False, 'watchedServices': 0}
 
 # Pre-launch — bumped by hand for now. Real version control comes later.
-VERSION = '0.3.7'
+VERSION = '0.3.9'
 
 def load_config():
     if CONFIG_FILE.exists():
@@ -1996,6 +2041,27 @@ def broadcast(msg):
         sess.send(msg)
 
 
+LED_ROOT        = '/sys/class/leds'
+ETH_LED_HELPER  = '/usr/local/sbin/pilink-write-boot-config'
+BOOT_STAGED     = CONFIG_DIR / 'boot_config_staged.txt'
+FIX_PERMS_HINT  = 'Run: sudo bash ~/.pilink/fix-permissions.sh'
+
+
+def _perm_hint(what, detail=''):
+    """One remedy, one script.
+
+    The message this replaces told the user to run `sudo usermod -a -G led
+    <user>`, which cannot work anywhere PiLink runs -- there is no `led` group.
+    Raspberry Pi OS hands LED sysfs to `gpio` through its own udev rule, and
+    Ubuntu ships no rule at all, which is why the toggles worked on one and not
+    the other. Pointing at the provisioning script instead keeps one source of
+    truth, rather than a command baked into an error string that drifts from
+    whatever the installer actually does.
+    """
+    tail = f' ({detail})' if detail else ''
+    return f'{what}{tail}. {FIX_PERMS_HINT}'
+
+
 def get_boot_config_path():
     """Return the path to /boot/firmware/config.txt or /boot/config.txt, whichever exists."""
     for p in ['/boot/firmware/config.txt', '/boot/config.txt']:
@@ -2051,25 +2117,30 @@ def set_eth_led_config(led0_val, led1_val):
     if not found1 and led1_val is not None:
         new_lines.append(f'dtparam=eth_led1={led1_val}\n')
     content = ''.join(new_lines)
-    # Write via sudo cp from a temp file (boot partition is root-owned)
-    tmp = '/tmp/pilink_boot_cfg_tmp.txt'
-    with open(tmp, 'w') as f:
+    # The boot partition is root-owned, so this goes through the single
+    # privileged helper the installer lays down, which re-checks that we are
+    # only changing eth_led dtparams. Staging inside CONFIG_DIR rather than
+    # /tmp is part of that contract: the helper refuses a staged file that
+    # anyone but us can write, and /tmp is world-writable.
+    # Created 0600 rather than written and then chmod'ed: the helper rejects a
+    # staged file that group or other can write, and a permissive umask would
+    # otherwise leave exactly that, briefly, between the two calls.
+    fd = os.open(BOOT_STAGED, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
         f.write(content)
-    result = subprocess.run(['sudo', 'cp', tmp, path], capture_output=True, timeout=10)
-    try:
-        os.unlink(tmp)
-    except Exception:
-        pass
+    os.chmod(BOOT_STAGED, 0o600)   # O_CREAT's mode is ignored if it already existed
+    result = subprocess.run(['sudo', '-n', ETH_LED_HELPER], capture_output=True, timeout=15)
     if result.returncode != 0:
-        raise PermissionError(
-            f'Could not write {path}: {result.stderr.decode().strip()}'
-        )
+        err = (result.stderr or result.stdout or b'').decode(errors='replace').strip()
+        # -n means no password prompt, so an unprovisioned box fails here
+        # instantly instead of returning sudo's "a terminal is required".
+        raise PermissionError(_perm_hint(f'Could not write {path}', err[:200]))
 
 def get_leds():
     """Read all LEDs from /sys/class/leds and return their state."""
     import os
     leds = []
-    base = '/sys/class/leds'
+    base = LED_ROOT
     if not os.path.isdir(base):
         return leds
     for name in sorted(os.listdir(base)):
@@ -2098,9 +2169,46 @@ def get_leds():
 
 LED_STATE_FILE = CONFIG_DIR / 'led_state.json'
 
+def _led_base(name):
+    """Resolve an LED name to its sysfs directory, or raise.
+
+    Membership in the real directory listing is the entire check, deliberately
+    instead of a path join plus isdir(). `name` arrives from the app, and
+    '../../etc' joins to a directory that very much exists -- which would hand
+    _write_led_attr an arbitrary path to write, through sudo, as root. Compare
+    against listdir() so that only something that is actually an LED can ever
+    be named.
+    """
+    if not isinstance(name, str) or not name:
+        raise FileNotFoundError('No LED name given')
+    try:
+        entries = os.listdir(LED_ROOT)
+    except OSError:
+        raise FileNotFoundError(f'{LED_ROOT} is not present on this machine')
+    if name not in entries:
+        raise FileNotFoundError(f'LED {name!r} not found')
+    return os.path.join(LED_ROOT, name)
+
+
+def _led_triggers(base):
+    """The trigger names this particular LED accepts, per its own sysfs file."""
+    try:
+        raw = open(os.path.join(base, 'trigger')).read().split()
+    except OSError:
+        return []
+    return [t[1:-1] if t.startswith('[') and t.endswith(']') else t for t in raw]
+
+
 def _write_led_attr(base, attr, value):
-    """Write a sysfs LED attribute, falling back to passwordless `sudo tee` if the
-    service user lacks direct write permission on the file."""
+    """Write a sysfs LED attribute.
+
+    Once fix-permissions.sh has run the direct write is the whole story: its
+    udev rule puts the attributes in the `pilink` group, so no privilege is
+    involved. The sudo fallback only covers a box that was never provisioned,
+    and uses -n so it fails immediately rather than blocking on a password
+    prompt nobody can answer -- a service has no terminal, which is precisely
+    the "a terminal is required" failure this used to surface to the app.
+    """
     path = os.path.join(base, attr)
     try:
         with open(path, 'w') as f:
@@ -2108,11 +2216,10 @@ def _write_led_attr(base, attr, value):
         return
     except PermissionError:
         pass
-    result = subprocess.run(['sudo', 'tee', path], input=f'{value}\n'.encode(),
+    result = subprocess.run(['sudo', '-n', 'tee', path], input=f'{value}\n'.encode(),
                             capture_output=True, timeout=5)
     if result.returncode != 0:
-        user = os.environ.get('USER', 'pi')
-        raise PermissionError(f'Cannot write LED {attr} — run: sudo usermod -a -G led {user}')
+        raise PermissionError(_perm_hint(f'Cannot write LED {attr}'))
 
 def save_led_state(name, trigger):
     """Remember one LED's desired trigger so it can be restored after a reboot."""
@@ -2135,9 +2242,10 @@ def set_led(name, trigger, persist=True):
     The desired state is persisted and re-applied on boot by restore_leds(), because
     sysfs LED triggers reset to their kernel defaults on every reboot (which is why
     an LED the user turned off came back on after a restart)."""
-    base = f'/sys/class/leds/{name}'
-    if not os.path.isdir(base):
-        raise FileNotFoundError(f'LED {name!r} not found')
+    base = _led_base(name)
+    valid = _led_triggers(base)
+    if valid and trigger not in valid:
+        raise ValueError(f'LED {name!r} has no trigger {trigger!r}')
     _write_led_attr(base, 'trigger', trigger)
     if trigger == 'none':
         try:
@@ -2311,6 +2419,13 @@ def _pkg_display(items):
 # -- GitHub self-update source (Pi pulls its own code; app only triggers) -------
 GITHUB_REPO       = 'spencermoya-byte/PiLink'
 GITHUB_BRANCH     = 'main'
+# Where Update Server looks, and downloads from. The PUBLIC mirror, which
+# publish-server.yml regenerates from pi-server/ on every published release and
+# gives a matching Release. Public means no Pi needs a token -- dev-pi's update
+# check failed for exactly that reason -- and the mirror only ever holds
+# released code, never whatever happens to be on the private repo's main.
+# Files sit at the mirror's root, not under pi-server/.
+UPDATE_REPO       = 'spencermoya-byte/pilink-server'
 GITHUB_TOKEN_FILE = CONFIG_DIR / 'github_token'   # optional; required for a PRIVATE repo
 
 def _github_token():
@@ -2321,72 +2436,101 @@ def _github_token():
     except Exception:
         return None
 
-def _http_get(url, timeout=25, accept='application/vnd.github+json'):
+def _http_get(url, timeout=25, accept='application/vnd.github+json', auth=True):
     headers = {'User-Agent': 'PiLink-Server', 'Accept': accept}
-    tok = _github_token()
+    tok = _github_token() if auth else None
     if tok:
         headers['Authorization'] = f'Bearer {tok}'
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
+def _version_tuple(v):
+    """(1, 2, 3) from '1.2.3' or 'v1.2.3', ignoring any suffix, for ordering.
+
+    None when it cannot be parsed, so callers fall back to a string compare
+    instead of silently deciding that an update exists.
+    """
+    m = re.match(r'v?(\d+(?:\.\d+)*)', str(v or '').strip())
+    return tuple(int(p) for p in m.group(1).split('.')) if m else None
+
+
+def _is_newer(latest, current):
+    """True only when `latest` is strictly newer than `current`.
+
+    The test used to be `latest != current`, which calls a server that is
+    NEWER than the published release "out of date" and offers a downgrade --
+    the normal state whenever a Pi is deployed straight from the working tree
+    rather than from a release.
+    """
+    lt, ct = _version_tuple(latest), _version_tuple(current)
+    if lt is None or ct is None:
+        return str(latest) != str(current)
+    return lt > ct
+
+
 def _latest_release():
-    """(tag, notes, date) of the newest published GitHub release (including
-    pre-releases / alpha), or (None, '', '') if none exist or GitHub is
-    unreachable. `date` is the ISO published_at, surfaced so the update sheet can
-    show a real release date instead of a placeholder. Uses the list endpoint
-    because /releases/latest hides pre-releases."""
+    """(tag, notes, date, err) of the newest published GitHub release (including
+    pre-releases / alpha). `date` is the ISO published_at, surfaced so the update
+    sheet can show a real release date instead of a placeholder. Uses the list
+    endpoint because /releases/latest hides pre-releases.
+
+    `err` is None on success and a short message when GitHub could not be
+    reached. Callers must not treat that case as "an update is available": it
+    used to collapse into the same (None, ...) as "this repo has no releases",
+    and the update sheet then offered an update it could never apply.
+    """
     try:
         data = json.loads(_http_get(
-            f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=10').decode('utf-8', 'replace'))
+            f'https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=10', auth=False).decode('utf-8', 'replace'))
         if isinstance(data, list):
             for rel in data:            # newest first
                 if rel.get('draft'):
                     continue
                 tag = rel.get('tag_name')
                 if tag:
-                    return tag, (rel.get('body') or ''), (rel.get('published_at') or '')
-        return None, '', ''
-    except Exception:
-        return None, '', ''
+                    return tag, (rel.get('body') or ''), (rel.get('published_at') or ''), None
+        return None, '', '', None
+    except Exception as e:
+        return None, '', '', _github_error(e)
+
+def _github_error(e):
+    """Say WHY checking for a server release failed, in terms of what to do.
+
+    Everything used to read "could not reach GitHub", including failures that
+    weren't network problems at all -- which is how dev-pi's missing token (the
+    update check then pointed at the private repo) went undiagnosed.
+    """
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 404:
+            return f"GitHub has no repo at {UPDATE_REPO} (is the public mirror set up?)."
+        if e.code in (403, 429):
+            return 'GitHub is rate-limiting this Pi. Try again in a few minutes.'
+        return f'GitHub answered HTTP {e.code}.'
+    if isinstance(e, urllib.error.URLError):
+        return f"This Pi couldn't reach GitHub ({getattr(e, 'reason', e)}). Check its internet connection."[:200]
+    return f'Checking GitHub failed ({e})'[:200]
 
 def _fetch_requirements(ref):
-    """Pull requirements.txt for the same ref so the self-update can install
-    anything new.
-
-    Uses the authenticated Contents API when a token is present -- the repo is
-    private, and raw.githubusercontent 404s anonymously for private content, so
-    the naive raw URL would silently return nothing and skip the install.
-
-    Returns bytes, or None if unavailable (older tags may predate the file, and
-    that must never break an update)."""
+    """requirements.txt from the public mirror at `ref`, so the self-update can
+    install anything new. None if unavailable -- older tags may predate the
+    file, and that must never break an update."""
     try:
-        tok = _github_token()
-        if tok:
-            return _http_get(
-                f'https://api.github.com/repos/{GITHUB_REPO}/contents/pi-server/requirements.txt?ref={ref}',
-                accept='application/vnd.github.raw')
-        return _http_get(
-            f'https://raw.githubusercontent.com/{GITHUB_REPO}/{ref}/pi-server/requirements.txt',
-            accept='text/plain')
+        return _http_get(f'https://raw.githubusercontent.com/{UPDATE_REPO}/{ref}/requirements.txt',
+                         accept='text/plain', auth=False)
     except Exception:
         return None
 
 
 def _fetch_server_source(ref):
-    """Download pilink-server.py (+agent) from the repo at `ref`. With a token
-    present, uses the authenticated Contents API (works for a PRIVATE repo);
-    otherwise the public raw host. Returns (server_bytes, agent_bytes_or_None)."""
-    tok = _github_token()
-    def get(path):
-        if tok:
-            return _http_get(f'https://api.github.com/repos/{GITHUB_REPO}/contents/{path}?ref={ref}',
-                             accept='application/vnd.github.raw')
-        return _http_get(f'https://raw.githubusercontent.com/{GITHUB_REPO}/{ref}/{path}',
-                         accept='text/plain')
-    server = get('pi-server/pilink-server.py')
+    """Download pilink-server.py (+agent) from the public mirror at `ref` (a
+    release tag). Returns (server_bytes, agent_bytes_or_None)."""
+    def get(name):
+        return _http_get(f'https://raw.githubusercontent.com/{UPDATE_REPO}/{ref}/{name}',
+                         accept='text/plain', auth=False)
+    server = get('pilink-server.py')
     try:
-        agent = get('pi-server/pilink-agent.py')
+        agent = get('pilink-agent.py')
         if len(agent) < 128:
             agent = None
     except Exception:
@@ -2461,27 +2605,76 @@ def _units_for_repo(repo: str) -> list:
             continue
     return confirmed
 
+# Every read-modify-write of schedules.json goes through this. A run's outcome
+# is recorded from the run's own thread, and without the lock the scheduler
+# loop (or an app push) could load the file just before that write and save
+# over it moments after -- losing the one record that says why a task failed.
+_sched_lock = threading.RLock()
+
 def load_schedules():
     return json.loads(SCHED_FILE.read_text()) if SCHED_FILE.exists() else []
 
 def save_schedules(s):
-    SCHED_FILE.write_text(json.dumps(s, indent=2))
+    tmp = SCHED_FILE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(s, indent=2))
+    os.replace(tmp, SCHED_FILE)
 
-def _schedule_failed(s, detail):
+# Fields the Pi owns. The app pushes its whole copy of a schedule on every
+# Scheduler open, and that copy only knows what the app happened to witness.
+_SCHED_PI_OWNED = ('execHistory', 'runLog', 'lastResult')
+
+def _record_schedule_result(sched, ok, detail=None, run_at=None):
+    """Persist how a run went, so "did it work, and if not why?" has an answer
+    after the fact -- not only if the app happened to be connected at the time.
+
+    Mutates `sched` in place as well as the file, so a caller already holding a
+    loaded list (the scheduler loop) saves the same thing rather than clobbering it.
+    """
+    entry = {'at': run_at or int(time.time() * 1000), 'ok': bool(ok)}
+    if not ok:
+        entry['error']  = (detail or '')[:500]
+        entry['reason'] = _plain_reason(detail)
+        entry['fix']    = _plain_fix(detail, sched)
+    sid = sched.get('id')
+    with _sched_lock:
+        scheds = load_schedules()
+        cur = next((x for x in scheds if x.get('id') == sid), None)
+        base = cur if cur is not None else sched
+        log = [entry] + [e for e in (base.get('runLog') or []) if e.get('at') != entry['at']]
+        log = log[:25]
+        for target in filter(None, (cur, sched)):
+            target['runLog'] = log
+            target['lastResult'] = entry
+        if cur is not None:
+            save_schedules(scheds)
+    broadcast({'type': 'schedule_result', 'scheduleId': sid, 'result': entry})
+    return entry
+
+def _schedule_failed(s, detail, run_at=None):
     """A schedule that silently fails to do anything is worse than one that errors
-    loudly -- you keep believing it works. Log, audit, and tell the app."""
+    loudly -- you keep believing it works. Log, audit, record, and tell the app.
+
+    The push carries the schedule's id so a tap opens that task, and the failure
+    is stored ON the schedule, so the app has something to show when it gets
+    there -- previously the reason lived only in the journal and the Scheduler
+    screen showed the failed run with a green tick.
+    """
     print(f'[scheduler] FAILED {s.get("id")} ({s.get("type")}): {detail}')
     audit('schedule_failed', {'id': s.get('id'), 'type': s.get('type'), 'error': detail})
-    broadcast({'type': 'schedule_error', 'scheduleId': s.get('id'), 'error': detail})
+    entry = _record_schedule_result(s, False, detail, run_at)
+    broadcast({'type': 'schedule_error', 'scheduleId': s.get('id'), 'error': detail,
+               'reason': entry.get('reason'), 'fix': entry.get('fix')})
     label = s.get('label') or s.get('type') or 'A scheduled task'
-    reason = _plain_reason(detail)
+    reason = entry.get('reason')
     push_notify('schedule',
                 f'{CONFIG["name"]}: "{label}" didn\'t run',
-                (reason + ' Open PiLink for details.') if reason
-                else 'The scheduled task failed. Open PiLink to see why.',
-                key=str(s.get('id')))
+                (reason + ' Tap to see how to fix it.') if reason
+                else 'Tap to see what went wrong and how to fix it.',
+                key=str(s.get('id')),
+                extra={'kind': 'schedule_failed', 'scheduleId': s.get('id')},
+                alert_message=f'"{label}" didn\'t run' + (f' — {reason}' if reason else ''))
 
-def run_schedule(s):
+def run_schedule(s, run_at=None):
     """Execute a schedule and REPORT THE OUTCOME.
 
     `sudo -n` is deliberate: without it sudo blocks on a password prompt that no
@@ -2511,24 +2704,25 @@ def run_schedule(s):
     elif t in ('custom', 'script') and cmd:
         argv, shell = cmd, True
     else:
-        _schedule_failed(s, f'nothing to run (type={t!r}, no command)')
+        _schedule_failed(s, f'nothing to run (type={t!r}, no command)', run_at)
         return
 
     try:
         r = subprocess.run(argv, shell=shell, capture_output=True, text=True, timeout=3600)
     except subprocess.TimeoutExpired:
-        _schedule_failed(s, 'timed out after 1h')
+        _schedule_failed(s, 'timed out after 1h', run_at)
         return
     except Exception as e:
-        _schedule_failed(s, f'{type(e).__name__}: {e}')
+        _schedule_failed(s, f'{type(e).__name__}: {e}', run_at)
         return
 
     if r.returncode != 0:
         # Surface the most useful line rather than a bare exit code.
         lines = ((r.stderr or '') + (r.stdout or '')).strip().splitlines()
-        _schedule_failed(s, lines[-1].strip() if lines else f'exit {r.returncode}')
+        _schedule_failed(s, lines[-1].strip() if lines else f'exit {r.returncode}', run_at)
     else:
         print(f'[scheduler] {s.get("id")} ({t}) ok')
+        _record_schedule_result(s, True, run_at=run_at)
 
 def _cron_field(field, value, lo, hi):
     """Match one cron field. Supports *, a, a-b, a,b, */n, a-b/n."""
@@ -2624,6 +2818,11 @@ def scheduler_loop():
     last_heartbeat = 0
     while True:
         try:
+          # Runs start only after the save below: a task that fails instantly
+          # (sudo -n with no rule returns in milliseconds) would otherwise record
+          # its failure and then have this loop save over it with a stale copy.
+          to_run = []
+          with _sched_lock:
             schedules = load_schedules()
             now_ms = int(time.time() * 1000)
             changed = False
@@ -2649,7 +2848,7 @@ def scheduler_loop():
                 if not s.get('enabled'): continue
                 nxt = s.get('nextRun', 0)
                 if nxt and now_ms >= nxt:
-                    threading.Thread(target=run_schedule, args=(s,), daemon=True).start()
+                    to_run.append((s, now_ms))
                     s['lastRun'] = now_ms
                     nxt_s = _cron_next(s.get('cronExpression', ''), now_ms // 1000)
                     # Record history HERE, not in the app. The app only ever
@@ -2676,6 +2875,8 @@ def scheduler_loop():
                     })
                     print(f'[scheduler] fired {s.get("id")} ({s.get("type")})')
             if changed: save_schedules(schedules)
+          for sched, at in to_run:
+              threading.Thread(target=run_schedule, args=(sched, at), daemon=True).start()
         except Exception as e:
             print(f'[scheduler] {e}')
         time.sleep(30)
@@ -2933,23 +3134,36 @@ class ClientSession:
 
     def on_check_server_update(self):
         """Report the running version vs the latest GitHub release (or main)."""
-        tag, notes, date = _latest_release()
+        tag, notes, date, err = _latest_release()
+        if err:
+            # Unreachable GitHub is not the same thing as an update waiting.
+            self.send({'type': 'server_update_info', 'source': 'release',
+                       'current': VERSION, 'latest': VERSION,
+                       'hasUpdate': False, 'error': err})
+            return
         if tag:
             latest = tag.lstrip('v')
             self.send({'type': 'server_update_info', 'source': 'release',
                        'current': VERSION, 'latest': latest, 'tag': tag,
-                       'notes': notes, 'date': date, 'hasUpdate': latest != VERSION})
+                       'notes': notes, 'date': date,
+                       'hasUpdate': _is_newer(latest, VERSION)})
         else:
-            self.send({'type': 'server_update_info', 'source': 'main',
-                       'current': VERSION, 'tag': GITHUB_BRANCH, 'notes': '',
-                       'hasUpdate': True})
+            # No published release on the mirror. This used to offer "main" as
+            # an update -- forever, since there'd never be a version to compare.
+            self.send({'type': 'server_update_info', 'source': 'release',
+                       'current': VERSION, 'latest': VERSION, 'hasUpdate': False,
+                       'error': 'No server release has been published yet.'})
 
     def on_pull_update(self, msg):
         """Fetch server code from GitHub (latest release, else main), verify, install, restart."""
         try:
             self.send({'type': 'server_update_progress', 'message': 'Finding latest release...'})
-            tag, _, _ = _latest_release()
-            ref = tag or GITHUB_BRANCH
+            tag, _, _, err = _latest_release()
+            if not tag:
+                self.send({'type': 'server_update_error',
+                           'message': err or 'No server release has been published yet.'})
+                return
+            ref = tag
             self.send({'type': 'server_update_progress', 'message': f'Downloading {ref} from GitHub...'})
             server_src, agent_src = _fetch_server_source(ref)
             if not server_src or len(server_src) < 512:
@@ -3020,11 +3234,15 @@ class ClientSession:
             return
         audit('run_schedule', {'id': sid, 'type': s.get('type'), 'ip': self.addr[0]})
         print(f'[scheduler] run now: {s.get("label") or sid} (type={s.get("type")})')
-        threading.Thread(target=run_schedule, args=(s,), daemon=True).start()
         now_ms = int(time.time() * 1000)
-        s['lastRun'] = now_ms
-        s['execHistory'] = ([now_ms] + list(s.get('execHistory') or []))[:25]
-        save_schedules(scheds)
+        with _sched_lock:
+            scheds = load_schedules()
+            s = next((x for x in scheds if x.get('id') == sid), s)
+            s['lastRun'] = now_ms
+            s['execHistory'] = ([now_ms] + list(s.get('execHistory') or []))[:25]
+            save_schedules(scheds)
+        # After the save, for the same reason as the scheduler loop.
+        threading.Thread(target=run_schedule, args=(s, now_ms), daemon=True).start()
         broadcast({'type': 'schedule_fired', 'scheduleId': sid,
                    'lastRun': now_ms, 'nextRun': s.get('nextRun', 0)})
 
@@ -3033,8 +3251,8 @@ class ClientSession:
 
         The certificate is public by definition — it's presented in the clear
         during every TLS handshake. Only the private key is secret, and that
-        never leaves the Pi. This runs on the authenticated channel, so a caller
-        already proved it knows the pairing key.
+        never leaves the Pi. Served before auth as well (see handle), because
+        the app must be able to pin it before it will send the pairing key.
 
         The app stores this PEM and uses it as the SOLE trusted CA for later
         connections, which is what turns "encrypted to somebody" into
@@ -3402,6 +3620,23 @@ class ClientSession:
         self.last_active = time.time()
         t = msg.get('type', '')
         if not self.authed:
+            if t == 'get_tls_cert':
+                # The ONE thing served before auth. The certificate is public
+                # (it's in every handshake), and the app needs it BEFORE it will
+                # send the pairing key: an unpinned connection is encrypted to
+                # "somebody", so the app fetches the cert here, checks it, pins
+                # it, and only then reconnects -- validated -- to authenticate.
+                # Rate-limited like auth, since it's unauthenticated work.
+                ip = self.addr[0]
+                with _AUTH_LOCK:
+                    recent = [ts for ts in _CERT_FETCHES.get(ip, []) if time.time() - ts < 60]
+                    recent.append(time.time())
+                    _CERT_FETCHES[ip] = recent
+                if len(recent) > 20:
+                    self.conn.close()
+                    return
+                self.on_get_tls_cert()
+                return
             if t == 'auth':
                 ip  = self.addr[0]
                 now = time.time()
@@ -3497,6 +3732,7 @@ class ClientSession:
         self.send({'type': 'schedules', 'data': load_schedules()})
 
     def on_set_schedule(self, msg):
+      with _sched_lock:
         scheds = load_schedules()
         s = msg.get('schedule', {})
         # Server is authoritative on timing. Reject a bad expression at the
@@ -3520,12 +3756,19 @@ class ClientSession:
             prev = scheds[idx].get('execHistory') or []
             if prev and not s.get('execHistory'):
                 s['execHistory'] = prev
+            # Outcomes are the Pi's alone -- never take the app's copy of them.
+            for k in ('runLog', 'lastResult'):
+                if k in scheds[idx]: s[k] = scheds[idx][k]
+                else: s.pop(k, None)
             scheds[idx] = s
-        else: scheds.append(s)
+        else:
+            for k in ('runLog', 'lastResult'): s.pop(k, None)
+            scheds.append(s)
         save_schedules(scheds)
 
     def on_delete_schedule(self, msg):
-        save_schedules([s for s in load_schedules() if s.get('id') != msg.get('id')])
+        with _sched_lock:
+            save_schedules([s for s in load_schedules() if s.get('id') != msg.get('id')])
 
     def on_register_push(self, msg):
         tok = (msg.get('token') or '').strip()
@@ -4290,7 +4533,11 @@ def mdns_register_loop():
                 port=PORT,
                 properties={
                     'model': CONFIG['model'],
-                    'pairingKey': CONFIG['pairing_key'],
+                    # NO pairingKey. It used to be here, which handed full
+                    # control of this Pi -- terminal included -- to anything on
+                    # the same Wi-Fi that could read multicast. The app now
+                    # proves ownership to pair: the Pi's own SSH login, or the
+                    # key typed in from install output. See PairingSheet.
                     'piId': CONFIG['pi_id'],
                     'version': CONFIG['version'],
                     # Certificate identity, advertised out of band. The app
@@ -4336,10 +4583,9 @@ def _tls_context():
     return _TLS_CTX or None
 
 def _accept_session(conn, addr):
-    """Opportunistic TLS. Peek at the first byte: 0x16 is a TLS ClientHello, so
-    wrap the socket; anything else is served as plaintext. Handling both on one
-    port means upgrading the app can never lock you out of the Pi - an older
-    plaintext client keeps working while a TLS-capable one gets encryption."""
+    """TLS required. Peek at the first byte: 0x16 is a TLS ClientHello, so wrap
+    the socket. Anything else is plaintext, refused unless config.json sets
+    "allow_plaintext": true -- the escape hatch for a client that can't do TLS."""
     try:
         conn.settimeout(5)
         first = conn.recv(1, socket.MSG_PEEK)
@@ -4353,6 +4599,20 @@ def _accept_session(conn, addr):
                 return
             conn = ctx.wrap_socket(conn, server_side=True)
             print(f'[tls] {addr} connected over TLS')
+        elif not CONFIG.get('allow_plaintext'):
+            # Plaintext used to be served on the same port so an old app could
+            # never be locked out. Every build since v0.2.4 speaks TLS, and a
+            # plaintext session carries the pairing key in the clear, so it is
+            # now refused unless the owner turns it back on in config.json
+            # ("allow_plaintext": true). Tell the client why before hanging up.
+            print(f'[tls] {addr} refused: plaintext connection (TLS required)')
+            audit('plaintext_refused', {'ip': addr[0]})
+            try:
+                conn.sendall(b'{"type": "auth_fail", "error": "This Pi requires an encrypted connection. Update PiLink."}\n')
+            except Exception:
+                pass
+            conn.close()
+            return
         conn.settimeout(None)
     except socket.timeout:
         # reachability probes connect without sending anything - close quietly
@@ -4367,11 +4627,10 @@ def _accept_session(conn, addr):
     ClientSession(conn, addr).run()
 
 def serve():
-    # Opportunistic TLS: this listener serves BOTH plaintext and TLS on the same
-    # port (see _accept_session), so the app can be upgraded without any risk of
-    # locking you out. The self-signed cert is generated on first run and the app
-    # pins its fingerprint TOFU-style. Auth is still enforced at the application
-    # layer via the pairingKey on every connection.
+    # TLS is required on this port (see _accept_session); plaintext only if the
+    # owner opts in. The self-signed cert is generated on first run; the app pins
+    # it exactly and sends the pairing key only over a connection validated
+    # against that pin.
     ensure_tls_cert()
 
     # Surface uncaught exceptions from handler threads (see _thread_excepthook).
@@ -4396,11 +4655,57 @@ def serve():
         print(f'[pilink] {addr} connected')
         threading.Thread(target=_accept_session, args=(conn, addr), daemon=True).start()
 
+def _system_is_stopping():
+    """True when the whole machine is going down, not just this service.
+
+    SIGTERM arrives for both `systemctl restart pilink-server` and a real
+    reboot, and those should not look the same in the app: a restart is a
+    two-second blip. `is-system-running` reports `stopping` only for the
+    latter, and a failed check falls through to the quiet path -- worst case
+    the app says "offline" instead of "rebooting", which is the old behaviour.
+    """
+    try:
+        r = subprocess.run(['systemctl', 'is-system-running'],
+                           capture_output=True, timeout=3)
+        return r.stdout.decode(errors='replace').strip() == 'stopping'
+    except Exception:
+        return False
+
+
+def _announce_going_down(signum, frame):
+    """Tell every connected app that this Pi is going away on purpose.
+
+    This corrects the assumption that used to live here -- that a Pi cannot
+    announce its own departure. It cannot announce a power cut, which is what
+    the app's silence watchdog covers, but systemd sends SIGTERM and then waits
+    out TimeoutStopSec before the network is torn down, so a reboot has a
+    window in which to speak. That window is the only moment anything in the
+    system knows the difference between "rebooting" and "fell off the network":
+    from the app's side a reboot it did not itself initiate is indistinguishable
+    from a dropped socket.
+
+    Exiting promptly matters. Installing a handler replaces the default SIGTERM
+    action, so anything that returns instead of exiting leaves systemd waiting
+    on its stop timeout before SIGKILL -- turning a quick reboot into a 90
+    second one.
+    """
+    try:
+        if _system_is_stopping():
+            broadcast({'type': 'going_down', 'reason': 'shutdown'})
+            time.sleep(0.3)      # let the writes reach the wire
+    except Exception:
+        pass
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(0)
+
+
 if __name__ == '__main__':
     print(f'\n  PiLink Server v{CONFIG["version"]}')
     print(f'  Device: {CONFIG["name"]}')
-    # The Pi announces its own return. It cannot announce its departure -- if
-    # it's down it can't send anything -- so "went offline" is detected app-side.
+    signal.signal(signal.SIGTERM, _announce_going_down)
     _check_optional_deps()
     threading.Thread(target=sentinel_loop,       daemon=True).start()
     threading.Thread(target=_announce_startup,   daemon=True).start()

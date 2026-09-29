@@ -63,6 +63,16 @@ StandardError=journal
 WantedBy=multi-user.target
 SERVICE
 
+# Hardware permissions: the sysfs LED group + udev rule, and the single root
+# helper behind the Ethernet port LEDs. Kept in its own script so an install
+# that predates it can repair itself without re-running the whole installer.
+# Run BEFORE the service starts -- systemd resolves supplementary groups at
+# unit start, so starting first would leave the server without the new group
+# until something restarted it.
+cp "$(dirname "$0")/fix-permissions.sh" "$PILINK_DIR/fix-permissions.sh"
+chmod +x "$PILINK_DIR/fix-permissions.sh"
+sudo bash "$PILINK_DIR/fix-permissions.sh" "$PILINK_USER"
+
 sudo systemctl daemon-reload
 sudo systemctl enable pilink-server pilink-agent
 sudo systemctl start pilink-server pilink-agent

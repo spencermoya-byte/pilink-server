@@ -394,7 +394,6 @@ def main():
         # Ask the worker what it actually is, rather than trusting the upload we
         # sent. This is the check that would have caught the drift: the deployed
         # worker reported a build nobody in the repo had, and no step compared.
-        import hashlib
         import re as _re
         src_txt = worker_src
         neutral = _re.sub(r"^const BUILD = '[^']*';$", "const BUILD = '';",
